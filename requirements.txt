@@ -1,0 +1,9 @@
+onnxruntime
+onnx
+onnxslim
+picamera2
+opencv-python-headless
+pandas
+paho-mqtt
+pyyaml
+ultralytics

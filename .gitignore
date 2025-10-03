@@ -1,0 +1,6 @@
+yolo_env/
+*.pyc
+__pycache__/
+*.csv
+runs/
+data/*.csv
