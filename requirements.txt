@@ -1,9 +1,10 @@
-onnxruntime
-onnx
-onnxslim
 picamera2
-opencv-python-headless
+opencv-python
+numpy
 pandas
 paho-mqtt
-pyyaml
-ultralytics
+blynklib
+ultralytics  # For YOLOv8
+onnxruntime  # For ONNX inference
+matplotlib  # For visualization
+RPi.GPIO
