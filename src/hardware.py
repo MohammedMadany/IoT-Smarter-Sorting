@@ -5,35 +5,31 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# GPIO Pins (aligned with tutorial)
+# GPIO Pins
 SERVO_MOVING_PIN = 25  # Servo 1 for moving tomatoes
-SERVO_SORTING_PIN = 17  # Servo 2 for dropping to bins
+SERVO_SORTING_PIN = 17  # Servo 2 for sorting (90° good, 180° bad)
 
-# PWM objects will be initialized in initialize_gpio()
 pwm_moving = None
 pwm_sorting = None
 
-# Initialize GPIO
 def initialize_gpio():
     global pwm_moving, pwm_sorting
-    GPIO.setmode(GPIO.BCM)  # Set BCM mode for pin numbering
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setwarnings(False)
     GPIO.setup([SERVO_MOVING_PIN, SERVO_SORTING_PIN], GPIO.OUT)
-    pwm_moving = GPIO.PWM(SERVO_MOVING_PIN, 50)  # 50 Hz for servo
+    pwm_moving = GPIO.PWM(SERVO_MOVING_PIN, 50)
     pwm_sorting = GPIO.PWM(SERVO_SORTING_PIN, 50)
     pwm_moving.start(0)
     pwm_sorting.start(0)
     logger.info("GPIO initialized for servos")
 
-# Servo Control
 def move_servo(pin, duty):
-    """Move servo with duty cycle (e.g., 2.0 for close, 7.0-12.0 for open/move)."""
     pwm = pwm_moving if pin == SERVO_MOVING_PIN else pwm_sorting
     pwm.ChangeDutyCycle(duty)
-    time.sleep(0.5)  # Allow servo to move
-    pwm.ChangeDutyCycle(0)  # Stop signal
-    logger.info("Servo on pin %d set to duty cycle %.1f", pin, duty)
+    time.sleep(0.5)
+    pwm.ChangeDutyCycle(0)
+    logger.info("Servo %d duty %.1f", pin, duty)
 
-# Cleanup
 def cleanup():
     global pwm_moving, pwm_sorting
     if pwm_moving:

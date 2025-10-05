@@ -1,185 +1,191 @@
 import sys
 import os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-import cv2
-import numpy as np
+# FIX: Add the project's root directory to the path 
+# so 'src.hardware' and 'project_utils.classifier' can be imported.
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))) 
+
+import threading
 import time
 import logging
-from collections import Counter
+import cv2
 import pandas as pd
-from datetime import datetime
 import paho.mqtt.client as mqtt
-import threading
-import blynklib
-from picamera2 import Picamera2
+from collections import Counter
+from datetime import datetime
 
-logging.basicConfig(level=logging.INFO)
+# Local imports - these now work correctly
+# Assuming these modules are correctly implemented in your project structure
+from src.hardware import initialize_gpio, move_servo, cleanup
+from picamera2 import Picamera2
+from project_utils.classifier import classify
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Settings
+# --- Global Settings and State ---
 CSV_FILE = 'data/sorting_counts.csv'
-MQTT_BROKER = 'broker.hivemq.com'
-MQTT_PORT = 1883
-MQTT_TOPIC = '/project/sorting/counts'
-BLYNK_AUTH = "Np_-A0Usy0S_47GzvzHZIHERP_Sp99-C"
-BLYNK_SERVER = 'blynk-cloud.com'
-BLYNK_PORT = 8080
-blynk = None
+THINGSBOARD_HOST = 'thingsboard.cloud'
+THINGSBOARD_PORT = 1883 # Standard MQTT port for non-TLS
+THINGSBOARD_TOKEN = "4IKb3Uj4JKNyhmSi9kA4" # Your device access token
+
 running = True
 frame_count = 0
+counts = Counter({'Red': 0, 'Green': 0, 'Reject': 0})
+mqtt_client = None
+start_time = time.time() # **NEW: Track script start time**
 
-def initialize_gpio():
-    """Initialize GPIO for servos."""
-    import RPi.GPIO as GPIO
-    GPIO.setmode(GPIO.BCM)
-    for pin in [25, 17]:
-        GPIO.setup(pin, GPIO.OUT)
-        GPIO.output(pin, GPIO.LOW)
-    logger.info("GPIO initialized for servos")
-
-def move_servo(pin, duty_cycle):
-    """Move servo to specified duty cycle."""
-    import RPi.GPIO as GPIO
-    pwm = GPIO.PWM(pin, 50)  # 50 Hz
-    pwm.start(0)
-    pwm.ChangeDutyCycle(duty_cycle)
-    time.sleep(1)
-    pwm.stop()
-
-def cleanup():
-    """Clean up GPIO on exit."""
-    import RPi.GPIO as GPIO
-    GPIO.cleanup()
-    logger.info("Hardware cleaned up")
-
-def classify(frame):
-    """Classify frame using HSV color detection (tunable ranges)."""
-    if frame is None:
-        return 'Uncertain'
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    hsv = cv2.cvtColor(hsv, cv2.COLOR_RGB2HSV)
-    
-    # Tunable HSV ranges (adjust based on testing)
-    lower_red = np.array([0, 120, 70])
-    upper_red = np.array([10, 255, 255])
-    lower_red2 = np.array([160, 120, 70])
-    upper_red2 = np.array([179, 255, 255])
-    lower_green = np.array([40, 40, 40])
-    upper_green = np.array([80, 255, 255])
-    
-    mask_red = cv2.inRange(hsv, lower_red, upper_red) + cv2.inRange(hsv, lower_red2, upper_red2)
-    mask_green = cv2.inRange(hsv, lower_green, upper_green)
-    
-    red_count = cv2.countNonZero(mask_red)
-    green_count = cv2.countNonZero(mask_green)
-    
-    if red_count > green_count and red_count > 2000:  # Increased threshold
-        return 'Red'
-    elif green_count > red_count and green_count > 2000:
-        return 'Green'
+# --- Paho MQTT Callback Functions ---
+def on_connect(client, userdata, flags, rc):
+    """Called when the MQTT client connects to the broker."""
+    if rc == 0:
+        logger.info("Paho MQTT Client connected to ThingsBoard successfully.")
+        # Send initial status attribute after connection
+        client.publish('v1/devices/me/attributes', '{"status": "Running", "deviceType": "Smart Sorter"}', qos=1)
     else:
-        return 'Uncertain'
+        logger.error(f"Paho MQTT Client failed to connect, return code {rc}")
 
+def on_disconnect(client, userdata, rc):
+    """Called when the MQTT client disconnects."""
+    logger.info(f"Paho MQTT Client disconnected with return code {rc}")
+
+# --- Helper Functions ---
 def save_to_csv(counts):
-    """Save classification counts to CSV."""
+    """Appends sorting counts with a timestamp to the CSV file."""
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S %A')
     df = pd.DataFrame([{'Timestamp': timestamp, **counts}])
     df.to_csv(CSV_FILE, mode='a', header=not os.path.exists(CSV_FILE), index=False)
-    logger.info("Saved counts to CSV: %s", counts)
+    # logger.info("Saved counts to CSV: %s", counts) # Removed to avoid excessive logging
 
-def publish_to_mqtt(counts):
-    """Publish counts to MQTT."""
-    try:
-        client = mqtt.Client()
-        client.connect(MQTT_BROKER, MQTT_PORT, 60)
-        client.publish(MQTT_TOPIC, str(counts), qos=1)
-        client.disconnect()
-        logger.info("Published to MQTT: %s", counts)
-    except Exception as e:
-        logger.error("MQTT publish failed: %s", str(e))
-
-def blynk_thread():
-    """Handle Blynk connection and heartbeat."""
-    global blynk
-    blynk = blynklib.Blynk(BLYNK_AUTH, server=BLYNK_SERVER, port=BLYNK_PORT)
-    logger.info("Blynk connection established")
-    while True:
-        blynk.run()
-        time.sleep(10)  # Reduced heartbeat interval
-        if blynk:
-            blynk.virtual_write(6, 1)  # Dummy heartbeat
-
-def start_stop_handler(value):
+def tb_publisher():
+    """Manages a persistent Paho MQTT connection and periodic telemetry publishing."""
+    global mqtt_client
+    global counts
     global running
-    running = value[0] == '1'
-    logger.info("System %s from Blynk", "started" if running else "stopped")
+    global start_time # Access the global start_time
 
+    # 1. Initialize Paho Client
+    mqtt_client = mqtt.Client(client_id='', protocol=mqtt.MQTTv311)
+    mqtt_client.on_connect = on_connect
+    mqtt_client.on_disconnect = on_disconnect
+    
+    # 2. Set ThingsBoard access token as username
+    mqtt_client.username_pw_set(username=THINGSBOARD_TOKEN)
+
+    # 3. Connect to ThingsBoard Cloud
+    try:
+        mqtt_client.connect(THINGSBOARD_HOST, THINGSBOARD_PORT, keepalive=60)
+    except Exception as e:
+        logger.error(f"Paho MQTT Connection failed: {e}")
+        return
+
+    mqtt_client.loop_start()
+
+    while running:
+        # **NEW: Calculate Working Time**
+        current_time = time.time()
+        working_time_sec = int(current_time - start_time) # Total runtime in seconds
+        
+        # Check connection status before trying to publish
+        if mqtt_client.is_connected():
+            try:
+                # Prepare telemetry payload
+                telemetry_data = dict(counts)
+                telemetry_data['working_time'] = working_time_sec # **NEW KEY ADDED**
+
+                # Publish to ThingsBoard (using json.dumps for clean JSON)
+                import json
+                payload = json.dumps(telemetry_data)
+                mqtt_client.publish('v1/devices/me/telemetry', payload, qos=1)
+                
+                logger.info("Published to ThingsBoard: %s", telemetry_data)
+            except Exception as e:
+                logger.error(f"Paho MQTT Publish failed: {e}")
+        else:
+             logger.warning("Paho MQTT Client not connected. Waiting for reconnection.")
+
+        # Publish every 5 seconds
+        time.sleep(5) 
+
+    # Stop the network loop and disconnect cleanly
+    mqtt_client.loop_stop()
+    if mqtt_client.is_connected():
+        mqtt_client.disconnect()
+    logger.info("ThingsBoard Publisher Thread stopped cleanly.")
+
+# --- Main Logic ---
 def main():
+    global running
+    global frame_count
+    
+    # Start the ThingsBoard publishing thread
+    publisher_thread = threading.Thread(target=tb_publisher, daemon=True)
+    publisher_thread.start()
+
+    # Hardware and Camera Initialization
     initialize_gpio()
     picam2 = Picamera2()
-    config = picam2.create_preview_configuration(main={"size": (320, 240)})
+    config = picam2.create_preview_configuration(main={"size": (640, 480)})
     picam2.configure(config)
     picam2.start()
     logger.info("Pi Camera initialized")
-    counts = Counter({'Red': 0, 'Green': 0, 'Reject': 0})
-
-    # Start Blynk thread
-    blynk_thread_instance = threading.Thread(target=blynk_thread)
-    blynk_thread_instance.daemon = True
-    blynk_thread_instance.start()
-
-    # Register Blynk handlers
-    if blynk:
-        blynk.on("V3", start_stop_handler)
 
     try:
-        while True:
-            if not running:
-                time.sleep(1)
-                continue
+        while running:
+            # Main loop handles classification and local data
             frame = picam2.capture_array()
             label = classify(frame)
-            global frame_count
+            
+            global counts
             frame_count += 1
             logger.info("Frame %d: Classified as %s", frame_count, label)
-            if label == 'Green':
-                move_servo(25, 12.0)
-                move_servo(17, 7.0)
-                counts['Green'] += 1
-                logger.info("Green Tomato detected - Servos moved")
-            elif label == 'Red':
-                move_servo(25, 7.0)
-                move_servo(17, 12.0)
+
+            # Sorting logic and count update
+            if label == 'Red':
+                move_servo(25, 7.0) 
+                move_servo(17, 90)   
                 counts['Red'] += 1
-                logger.info("Red Tomato detected - Servos moved")
+                logger.info("Good Tomato (Red) detected")
+            elif label == 'Green':
+                move_servo(25, 12.0)
+                move_servo(17, 180) 
+                counts['Green'] += 1
+                logger.info("Bad Tomato (Green) detected")
             else:
+                move_servo(25, 12.0)
                 counts['Reject'] += 1
-                logger.info("Uncertain detection - No action")
-            save_to_csv(counts)
-            publish_to_mqtt(counts)
-            # Real-time Blynk updates
-            if blynk:
-                blynk.virtual_write(0, counts['Red'])
-                blynk.virtual_write(1, counts['Green'])
-                blynk.virtual_write(2, counts['Reject'])
-            # Real-time camera feed and counter display
-            cv2.putText(frame, f'Red: {counts["Red"]}', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-            cv2.putText(frame, f'Green: {counts["Green"]}', (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            cv2.putText(frame, f'Reject: {counts["Reject"]}', (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 1, (128, 128, 128), 2)
+                logger.info("Uncertain detection - Rejected")
+
+            save_to_csv(counts) 
+            
+            # Display frame (optional, for local debug)
+            # You can add the working time here too if you like:
+            current_runtime = int(time.time() - start_time)
+            cv2.putText(frame, f'Runtime: {current_runtime}s', (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+            cv2.putText(frame, f'Red: {counts["Red"]}', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            cv2.putText(frame, f'Green: {counts["Green"]}', (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(frame, f'Reject: {counts["Reject"]}', (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
             cv2.imshow('Camera Feed', frame)
+            
             if cv2.waitKey(1) & 0xFF == ord('q'):
+                running = False
                 break
-            time.sleep(0.5)  # Adjusted for smoother display
+            
+            time.sleep(0.5) 
+            
     except KeyboardInterrupt:
-        logger.info("Shutting down via keyboard interrupt")
-    except Exception as e:
-        logger.error("Unexpected error in main loop: %s", str(e))
+        logger.info("Keyboard interrupt received.")
     finally:
+        running = False # Signal the publisher thread to stop
+        if publisher_thread.is_alive():
+            publisher_thread.join(timeout=6) 
+        logger.info("Shutting down main process.")
         cleanup()
         picam2.stop()
         cv2.destroyAllWindows()
-        logger.info("System shutdown complete")
 
 if __name__ == "__main__":
+    # Initialize start_time when the script begins
+    start_time = time.time()
     main()
