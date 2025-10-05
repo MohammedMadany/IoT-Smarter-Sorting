@@ -1,8 +1,7 @@
 import sys
 import os
 
-# FIX: Add the project's root directory to the path 
-# so 'src.hardware' and 'project_utils.classifier' can be imported.
+# Adding the project's root directory to the path 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))) 
 
 import threading
@@ -14,8 +13,7 @@ import paho.mqtt.client as mqtt
 from collections import Counter
 from datetime import datetime
 
-# Local imports - these now work correctly
-# Assuming these modules are correctly implemented in your project structure
+# Local imports 
 from src.hardware import initialize_gpio, move_servo, cleanup
 from picamera2 import Picamera2
 from project_utils.classifier import classify
@@ -28,13 +26,13 @@ logger = logging.getLogger(__name__)
 CSV_FILE = 'data/sorting_counts.csv'
 THINGSBOARD_HOST = 'thingsboard.cloud'
 THINGSBOARD_PORT = 1883 # Standard MQTT port for non-TLS
-THINGSBOARD_TOKEN = "4IKb3Uj4JKNyhmSi9kA4" # Your device access token
+THINGSBOARD_TOKEN = "4IKb3Uj4JKNyhmSi9kA4" 
 
 running = True
 frame_count = 0
 counts = Counter({'Red': 0, 'Green': 0, 'Reject': 0})
 mqtt_client = None
-start_time = time.time() # **NEW: Track script start time**
+start_time = time.time()
 
 # --- Paho MQTT Callback Functions ---
 def on_connect(client, userdata, flags, rc):
@@ -83,16 +81,13 @@ def tb_publisher():
     mqtt_client.loop_start()
 
     while running:
-        # **NEW: Calculate Working Time**
         current_time = time.time()
-        working_time_sec = int(current_time - start_time) # Total runtime in seconds
+        working_time_sec = int(current_time - start_time)
         
-        # Check connection status before trying to publish
         if mqtt_client.is_connected():
             try:
-                # Prepare telemetry payload
                 telemetry_data = dict(counts)
-                telemetry_data['working_time'] = working_time_sec # **NEW KEY ADDED**
+                telemetry_data['working_time'] = working_time_sec
 
                 # Publish to ThingsBoard (using json.dumps for clean JSON)
                 import json
@@ -159,8 +154,6 @@ def main():
 
             save_to_csv(counts) 
             
-            # Display frame (optional, for local debug)
-            # You can add the working time here too if you like:
             current_runtime = int(time.time() - start_time)
             cv2.putText(frame, f'Runtime: {current_runtime}s', (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
             cv2.putText(frame, f'Red: {counts["Red"]}', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
